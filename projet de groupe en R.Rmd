@@ -1,0 +1,430 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+
+# Introduction
+
+Ce projet analyse et compare les résultats des élections européennes de 2019 et 2024
+à différents niveaux territoriaux (régions, départements, communes du Nord).
+Les données proviennent du site data.gouv.fr.
+
+#Chargement des librairies
+```{r}
+
+library(tidyverse)
+library(readxl)
+library(janitor)
+library(sf)
+library(rnaturalearth)
+library(rnaturalearthdata)
+library(scales)
+library(ggridges)  
+
+```
+
+
+
+# Importation des données électorales
+
+```{r import}
+library(rio)
+library(janitor)
+library(dplyr)
+
+path_2019 <- "C:\\Users\\lodep\\OneDrive\\Documents\\R\\data\\resultats-definitifs-par-commune 2019.xls"
+path_2024 <- "C:\\Users\\lodep\\OneDrive\\Documents\\R\\data\\resultats-definitifs-par-commune 2024.xlsx"
+
+# Importation des données
+raw2019 <- import(path_2019) %>% clean_names()
+raw2024 <- import(path_2024) %>% clean_names()
+
+print(paste("Fichier 2019 chargé :", nrow(raw2019), "lignes"))
+print(paste("Fichier 2024 chargé :", nrow(raw2024), "lignes"))
+
+```
+
+## Préparation et nettoyage des données
+
+```{r}
+clean_2019_data <- function(raw_df) {
+  metadata <- raw_df[, 1:18] %>% 
+    clean_names() %>%
+    select(code_dept = code_du_departement, 
+           nom_dept = libelle_du_departement,
+           code_commune = code_de_la_commune, 
+           nom_commune = libelle_de_la_commune, 
+           exprimes)
+
+  results_part <- raw_df[, 19:ncol(raw_df)]
+  
+  num_cols <- ncol(results_part)
+  num_lists <- floor(num_cols / 7)
+  
+  new_headers <- c()
+  for(i in 1:num_lists) {
+    suffix <- paste0("_", i)
+    block <- c(paste0("ignoreA", suffix), 
+               paste0("ignoreB", suffix), 
+               paste0("liste", suffix),      
+               paste0("ignoreC", suffix), 
+               paste0("voix", suffix),       
+               paste0("ignoreD", suffix), 
+               paste0("ignoreE", suffix))
+    new_headers <- c(new_headers, block)
+  }
+  
+  new_headers <- new_headers[1:ncol(results_part)]
+  colnames(results_part) <- new_headers
+  
+  bind_cols(metadata, results_part) %>%
+    pivot_longer(
+      cols = matches("liste_|voix_"),
+      names_to = c(".value", "num"),
+      names_pattern = "(.*)_(\\d+)"
+    ) %>%
+    filter(!is.na(liste)) %>% 
+    mutate(
+      year = "2019",
+      voix = as.numeric(voix),
+      exprimes = as.numeric(exprimes),
+      pourcentage = voix / exprimes
+    ) %>%
+    select(year, code_dept, nom_dept, code_commune, nom_commune, liste, voix, exprimes, pourcentage)
+}
+
+
+df_2019_clean <- clean_2019_data(raw2019)
+glimpse(df_2019_clean)
+```
+
+```{r}
+clean_2024_data <- function(raw_df) {
+  raw_df %>%
+    clean_names() %>%
+    
+    rename(
+       libelle_de_liste_1 = libelle_de_liste_1, 
+       voix_1 = voix_1
+    ) %>%
+    select(
+      code_dept = code_departement,
+      nom_dept = libelle_departement,
+      code_commune = code_commune,
+      nom_commune = libelle_commune,
+      exprimes = exprimes,
+      matches("^libelle_de_liste_\\d+$"),
+      matches("^voix_\\d+$")
+    ) %>%
+    mutate(
+      code_dept = as.character(code_dept),
+      code_commune = as.character(code_commune),
+      exprimes = as.numeric(exprimes)
+    ) %>%
+    pivot_longer(
+      cols = matches("libelle|voix"),
+      names_to = c(".value", "num"),
+      names_pattern = "(.*)_(\\d+)"
+    ) %>%
+    rename(liste = libelle_de_liste) %>%
+    filter(!is.na(liste)) %>%
+    mutate(
+      year = "2024",
+      voix = as.numeric(voix),
+      pourcentage = voix / exprimes
+    ) %>%
+    select(year, code_dept, nom_dept, code_commune, nom_commune, liste, voix, exprimes, pourcentage)
+}
+
+
+df_2024_clean <- clean_2024_data(raw2024)
+glimpse(df_2024_clean)
+```
+
+```{r}
+# Combiner 
+df_combined <- bind_rows(df_2019_clean, df_2024_clean)
+dim(df_combined)
+df_combined
+
+
+```
+#Calcul des suffrages exprimés et filtrage (> 5 %)
+```{r}
+data_dept <- df_combined %>%
+  group_by(year, code_dept, nom_dept, liste) %>%
+  summarise(
+    voix_totale = sum(voix, na.rm = TRUE),
+    exprimes_totale = sum(exprimes, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(pourcentage = voix_totale / exprimes_totale) %>%
+  filter(pourcentage > 0.05)
+data_dept
+
+```
+# Construction de la base finale d’analyse
+
+```{r}
+data_nord_communes <- df_combined %>%
+  filter(code_dept == "59") %>%
+  filter(pourcentage > 0.05)
+
+print("Data successfully merged!")
+head(data_dept)
+```
+
+
+```{r}
+# --- FONCTION DE COMPARAISON ---
+
+comparer_evolution_liste <- function(nom_de_la_liste) {
+  
+  # Préparation des données pour le Nord (59)
+  evol_data <- df_combined %>%
+    filter(code_dept == "59", 
+           str_detect(liste, nom_de_la_liste)) %>%
+    select(year, nom_commune, pourcentage) %>%
+    pivot_wider(names_from = year, values_from = pourcentage) %>%
+    mutate(difference = `2024` - `2019`) %>%
+    filter(!is.na(difference)) %>%
+    arrange(desc(difference)) %>%
+    # On prend les 10 plus fortes progressions et 10 plus fortes baisses
+    filter(row_number() <= 10 | row_number() > (n() - 10))
+
+  ggplot(evol_data, aes(x = reorder(nom_commune, difference), y = difference, fill = difference > 0)) +
+    geom_col() +
+    coord_flip() +
+    scale_y_continuous(labels = scales::percent) +
+    scale_fill_manual(values = c("red", "darkgreen"), labels = c("Baisse", "Hausse")) +
+    labs(title = paste("Évolution du vote pour :", nom_de_la_liste, "(2019-2024)"),
+         subtitle = "Top 10 progressions et baisses dans le Nord",
+         x = "Commune", y = "Différence en points de pourcentage", fill = "Tendance") +
+    theme_minimal()
+}
+
+
+```
+
+
+
+# ANALYSE PAR DEPARTEMENT
+
+```{r map_dept_debug, fig.height=10, fig.width=12}
+library(dplyr)
+library(stringr)
+library(sf)
+library(rnaturalearth)
+
+# --- 1. CALCUL DES GAGNANTS ---
+winners_dept <- data_dept %>%
+  group_by(year, code_dept, nom_dept) %>%
+  slice_max(voix_totale, n = 1) %>% 
+  ungroup() %>%
+  mutate(code_dept = str_pad(as.character(as.integer(code_dept)), 2, pad = "0"))
+
+print(paste("Nombre de départements gagnants trouvés :", nrow(winners_dept)))
+
+# --- 2. PREPARATION DE LA CARTE ---
+france_sf <- ne_states(country = "france", returnclass = "sf") %>%
+  select(code_dept = postal, region, geometry) %>%
+  mutate(code_dept = str_pad(as.character(as.integer(substr(code_dept, 1, 2))), 2, pad = "0"))
+
+# --- 3. FUSION ---
+map_data <- france_sf %>%
+  inner_join(winners_dept, by = "code_dept")
+
+print(paste("Nombre de départements prêts à être tracés :", nrow(map_data)))
+
+# --- 4. AFFICHAGE (Seulement si on a des données) ---
+if(nrow(map_data) > 0) {
+  
+  ggplot(map_data) +
+    geom_sf(aes(fill = str_wrap(liste, 20)), color = "white", size = 0.1) +
+    facet_wrap(~year) +
+    scale_fill_viridis_d(option = "turbo", name = "Liste en tête") +
+    theme_void() +
+    labs(title = "Carte des listes en tête par département (2019 vs 2024)") +
+    theme(legend.position = "bottom")
+    
+} else {
+  print("ERREUR CRITIQUE : La fusion a échoué. Vérifiez les codes départements.")
+  print("Codes dans tes données :")
+  print(head(unique(winners_dept$code_dept)))
+  print("Codes dans la carte :")
+  print(head(unique(france_sf$code_dept)))
+}
+```
+
+
+# ANALYSE PAR REGIONS
+# 4. ANALYSE PAR REGIONS
+
+```{r region_final_debug, fig.height=10, fig.width=12}
+library(dplyr)
+library(sf)
+library(rnaturalearth)
+library(stringr)
+
+# --- ETAPE 1 : PREPARATION DE LA TABLE DE CORRESPONDANCE (DEPT -> REGION) ---
+# On récupère les départements de la carte pour savoir dans quelle région ils sont
+france_sf <- ne_states(country = "france", returnclass = "sf")
+
+dept_region_match <- france_sf %>%
+  st_drop_geometry() %>% # On garde juste les données, pas la carte
+  select(code_dept = postal, region_name = region) %>%
+  mutate(code_dept = str_pad(as.character(as.integer(code_dept)), 2, pad = "0"))
+
+print(paste("Correspondances Dept-Région chargées :", nrow(dept_region_match)))
+
+
+# --- ETAPE 2 : PREPARATION DES DONNEES DE VOTES ---
+df_clean_codes <- df_combined %>%
+  mutate(code_dept = str_pad(as.character(as.integer(code_dept)), 2, pad = "0"))
+
+# --- ETAPE 3 : JOINTURE ET CALCUL ---
+data_region <- df_clean_codes %>%
+  left_join(dept_region_match, by = "code_dept") %>%
+  filter(!is.na(region_name)) %>% # On vire ceux qui n'ont pas trouvé de région (DOM-TOM lointains souvent)
+  group_by(year, region_name, liste) %>%
+  summarise(
+    voix = sum(voix, na.rm = TRUE), 
+    exprimes = sum(exprimes, na.rm = TRUE), 
+    .groups="drop"
+  ) %>%
+  mutate(pourcentage = voix / exprimes)
+
+# --- ETAPE 4 : TROUVER LES GAGNANTS ---
+winners_region <- data_region %>%
+  group_by(year, region_name) %>%
+  slice_max(voix, n = 1) %>%
+  ungroup()
+
+print(paste("Nombre de régions gagnantes trouvées :", nrow(winners_region)))
+
+
+# --- ETAPE 5 : CARTE FINALE ---
+map_region_sf <- france_sf %>%
+  group_by(region) %>%
+  summarise(geometry = st_union(geometry)) %>%
+  rename(region_name = region)
+
+# Jointure finale
+map_data_reg <- map_region_sf %>%
+  inner_join(winners_region, by = "region_name")
+
+print(paste("Nombre de régions prêtes à être tracées :", nrow(map_data_reg)))
+
+# AFFICHAGE SECURISE
+if(nrow(map_data_reg) > 0) {
+  ggplot(map_data_reg) +
+    geom_sf(aes(fill = str_wrap(liste, 20)), color = "white") +
+    facet_wrap(~year) +
+    scale_fill_viridis_d(option = "turbo", name = "Liste en tête") +
+    theme_void() +
+    labs(title = "Carte des résultats par Région (2019 vs 2024)") +
+    theme(legend.position = "bottom")
+} else {
+  print("ERREUR : Aucune donnée à afficher. Vérifiez les noms des régions.")
+  # Diagnostic : Affiche les noms des régions pour comparer
+  print("Régions dans la carte :")
+  print(unique(map_region_sf$region_name))
+  print("Régions dans les données :")
+  print(unique(winners_region$region_name))
+}
+```
+
+
+
+#Graphique de présentation des résultats définitifs par communes pour 2019
+```{r}
+extremes_2019 <- df_combined %>%
+  filter(year == "2019") %>%
+  group_by(nom_commune) %>%
+  slice_max(pourcentage, n = 1) %>%
+  ungroup() %>%
+  arrange(desc(pourcentage)) %>%
+  filter(row_number() <= 10 | row_number() > (n() - 10)) %>%
+  mutate(groupe = if_else(row_number() <= 10, "Top 10", "Bottom 10"))
+extremes_2019
+
+# Graphique pour 2019
+ggplot(extremes_2019, 
+       aes(x = reorder(nom_commune, pourcentage), 
+           y = pourcentage, 
+           fill = groupe)) +
+  geom_col() +
+  coord_flip() +
+  scale_y_continuous(labels = scales::percent) +
+  labs(title = "Communes avec les scores les plus extrêmes (2019)",
+       x = "Commune", y = "Pourcentage de voix", fill = "") +
+  theme_minimal()
+```
+#Graphique de présentation des résultats définitifs par communes pour 2024
+
+```{r}
+extremes_2024 <- df_combined %>%
+  filter(year == "2024") %>%
+  group_by(nom_commune) %>%
+  slice_max(pourcentage, n = 1) %>%
+  ungroup() %>%
+  arrange(desc(pourcentage)) %>%
+  filter(row_number() <= 10 | row_number() > (n() - 10)) %>%
+  mutate(groupe = if_else(row_number() <= 10, "Top 10", "Bottom 10"))
+extremes_2024
+# Graphique
+ggplot(extremes_2024, 
+       aes(x = reorder(nom_commune, pourcentage), 
+           y = pourcentage, 
+           fill = groupe)) +
+  geom_col() +
+  coord_flip() +
+  scale_y_continuous(labels = scales::percent) +
+  labs(title = "Communes avec les scores les plus extrêmes (2024)",
+       x = "Commune", y = "Pourcentage de voix", fill = "") +
+  theme_minimal()
+```
+
+```{r}
+# --- GRAPHIQUES ORIGINAUX ---
+
+# 1. Ridge Plot (Distribution des scores par liste)
+# Montre où les votes sont concentrés ou dispersés
+ggplot(data_dept, aes(x = pourcentage, y = liste, fill = liste)) +
+  geom_density_ridges(alpha = 0.7) +
+  scale_x_continuous(labels = scales::percent) +
+  theme_ridges() +
+  labs(title = "Distribution des scores des listes par département", x = "Score (%)", y = "") +
+  theme(legend.position = "none")
+
+# 2. Scatter Plot de Corrélation (2019 vs 2024)
+# Permet de voir la stabilité du vote par département
+data_scatter <- data_dept %>%
+  select(year, nom_dept, liste, pourcentage) %>%
+  pivot_wider(names_from = year, values_from = pourcentage) %>%
+  filter(!is.na(`2019`) & !is.na(`2024`))
+
+ggplot(data_scatter, aes(x = `2019`, y = `2024`, color = liste)) +
+  geom_point() +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed") + # Ligne d'égalité
+  scale_x_continuous(labels = scales::percent) +
+  scale_y_continuous(labels = scales::percent) +
+  labs(title = "Scores 2019 vs 2024 par département",
+       subtitle = "Les points au-dessus de la ligne indiquent une progression") +
+  theme_minimal()
+
+# 3. Boxplot de la dispersion régionale
+# Compare comment chaque région vote de manière homogène ou non
+ggplot(data_region, aes(x = region_name, y = pourcentage, fill = region_name)) +
+  geom_boxplot() +
+  coord_flip() +
+  scale_y_continuous(labels = scales::percent) +
+  labs(title = "Dispersion des scores par Région", x = "", y = "Score (%)") +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+ 
+
+ 
+
